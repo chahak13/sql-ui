@@ -106,3 +106,14 @@ visits it in the editor buffer"
       (setq db-connections (json-add-to-object (json-new-object) "connections" existing-connections))
       (with-temp-file cm/sql-ui-connection-file
         (insert (json-encode db-connections))))))
+
+(defun sql-ui-quit ()
+  "Quit SQL-UI and kill related buffers."
+  (interactive)
+  (sql-ui--kill-buffers))
+
+(defun sql-ui--kill-buffers ()
+  "Kill buffers related to SQL-UI."
+  (kill-matching-buffers "^lsp-virtual" nil t)
+  (kill-matching-buffers "saved" nil t)
+  (kill-matching-buffers "\\*sql-ls-eglot results\\*" nil t))

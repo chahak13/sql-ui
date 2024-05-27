@@ -1,0 +1,181 @@
+#+title: SQL-UI
+#+subtitle: A major mode for working with databases inside Emacs
+
+* Thoughts
+Okay, time to take a step back and actually think through what and how I want to
+do this. This is what I want the user experience to be like:
+
++ I call some command, say =cm/sql-ui= and that sets up the window layout. The
+  layout in my mind looks kinda similar to =vim-dadbod-ui=.
++ The left panel shows two sections:
+  - Query buffers
+  - Saved queries
+    + These saved queries get saved in a directory. At least at the beginning,
+      these queries are stored in a set default directory.
+    + Ideally this should be configurable in terms of what /main directory/ is
+      the UI being run in.
+    + Pressing =RET= on any saved query should open it in the temp query
+      playground.
+      - This might require overwriting the keybinding for =RET= in =dired-mode=
+        (if I choose to go that route) in this particular buffer.
++ There is a bottom buffer that is for all the query results.
+  - This is a common results buffer for all the queries so if another query is
+    run, then it will overwrite the buffer.
++ The main query editor:
+  - This is the main playground for queries.
+  - On trying to save the query, it prompts the user for the name of the file to
+    be saved.
+  - When saved, these queries should show up in the left panel.
+  - I don't need multiple playground buffers. At least not in the beginning.
++ How does this work. Single major mode? Multiple minor modes?
+  - Kinda like magit? Magit has a single major mode and there are other minor
+    modes.
+  - Could also be minor modes that are enabled? Maybe the queries panel can be a
+    dired buffer
++ Bundle this all in a proper package and try it out on work laptop.
+
+
+Instead of creating a temp file in the =/tmp= directory, create a temp file for
+the queries in the =sql-ui= directory so that the connections' =config.json= can
+be used by =eglot=.
+* Window layout
+** Default layout
+
+For the window layout, I want to start out with something similar to the layout
+provided by vim-dadbod-ui. To set this up, I use the following functions. I also
+need to make sure that the query editor opens up in a temp file for a new query
+but also need to make sure that in that buffer, if the user tries to save the
+file, it actually prompts for a new file to save instead.
+
+#+begin_src elisp
+(require 'f)
+(require 'dired)
+(require 'eglot)
+
+(defvar sql-ui-default-directory "~/.local/sql-ui/")
+
+(defun cm/sql-ui-save-buffer-as-file ()
+  "Prompt for a new file name and save the current buffer to that file."
+  (interactive)
+  (unless (f-dir-p "~/.local/sql-ui/saved")
+    (make-directory "~/.local/sql-ui/saved" t))
+  (let ((file-name (read-file-name "Save query as: " "~/.local/sql-ui/saved/")))
+    (write-region (point-min) (point-max) file-name)
+    (set-visited-file-name file-name)
+    (message "Buffer saved to %s" file-name))
+  (with-current-buffer (get-buffer-create "~/.local/sql-ui/saved/")
+    (dired "~/.local/sql-ui/saved/"))
+  (switch-to-buffer cm/sql-ui-playground-file)
+  (funcall 'sql-mode))
+
+(defun cm/sql-ui-open-saved-query ()
+  "Open file at point in BUFFER."
+  (interactive)
+  (let ((file-name (dired-get-file-for-visit)))
+  (with-current-buffer (get-buffer-create (f-filename cm/sql-ui-playground-file))
+    (insert-file-contents file-name nil nil nil t)
+    )))
+
+
+(defun cm/sql-ui--make-temp-file (directory)
+  "Create a temporary file in the specified DIRECTORY and return its path."
+  (let ((temporary-file-directory directory))  ;; Set the temporary directory
+    (unless (f-dir-p directory)
+      (make-directory directory t))
+    (make-temp-file "lsp-virtual-" nil ".sql")))
+
+(defun sql-ui--create-editor-buffer ()
+  "Create the query editor buffer.
+
+This creates a temporary sql file in `sql-ui-default-directory' and
+visits it in the editor buffer"
+  (let ((tmp-file (cm/sql-ui--make-temp-file (f-join sql-ui-default-directory "tmp"))))
+    (setq cm/sql-ui-playground-file tmp-file)
+    (set-buffer (create-file-buffer tmp-file))
+    (funcall 'sql-mode)
+    (current-buffer)))
+
+(defvar cm/sql-ui-playground-file nil)
+(defun cm/sql-ui-default-layout ()
+  "Create the default layout for SQL-UI in Emacs."
+  (interactive)
+  ;; Set buffer for each window
+  (let ((queries-buffer (if (f-dir-p "~/.local/sql-ui/saved/")
+                            (dired "~/.local/sql-ui/saved/")
+                          (progn
+                            (make-directory "~/.local/sql-ui/saved" t)
+                            (dired "~/.local/sql-ui/saved/"))))
+        (editor-buffer (sql-ui--create-editor-buffer))
+        (results-buffer (get-buffer-create "*sql-ls results*")))
+    (delete-other-windows)
+    (set-window-buffer (frame-first-window) editor-buffer)
+    (display-buffer-in-side-window results-buffer '((side . bottom)))
+    (display-buffer-in-side-window queries-buffer '((side . left)))
+    (with-current-buffer queries-buffer
+      (dired-hide-details-mode t)
+      (keymap-local-set "C-M-<return>" 'cm/sql-ui-open-saved-query)
+      )
+    (switch-to-buffer editor-buffer)
+    (keymap-local-set "C-x C-s" 'cm/sql-ui-save-buffer-as-file)
+    ))
+
+#+end_src
+
+#+RESULTS:
+: cm/sql-ui-default-layout
+
+* Maintaining DB Connections
+DB Connections are maintained in a JSON file with the same structure as defined
+for =sql-lsp= to make it easier to add autocompletion and query execution. To
+make it easier to add new connections to the file, there is a helper function
+
+#+begin_src emacs-lisp :tangle yes
+(require 'json)
+(require 'cl-lib)
+
+(defvar cm/sql-ui-connection-file "~/.local/sql-ui/.sql-ls/config.json")
+
+(defun cm/sql-ui--connection-exists (alias connections)
+  "Check if the ALIAS already exists in CONNECTIONS."
+  (cl-some (lambda (connection)
+             (and (eq (car connection) alias) connection))
+           connections))
+
+(defun cm/sql-ui-add-connection (alias new-db-connection)
+  "Load a JSON file at FILE-PATH, check if KEY exists,
+   and add NEW-JSON-OBJECT if the key is missing.
+   Save the updated JSON to the file."
+  (unless (f-directory-p (f-dirname cm/sql-ui-connection-file))
+      (make-directory (f-dirname cm/sql-ui-connection-file) t))
+  (let* ((db-connections (if (file-exists-p cm/sql-ui-connection-file)
+                          (with-temp-buffer
+                            (insert-file-contents cm/sql-ui-connection-file)
+                            (json-read))
+                          (list 'connections '())))
+         (existing-connections (cdr (assoc 'connections db-connections)))
+         (new-connection (push alias new-db-connection)))
+    (if (cm/sql-ui--connection-exists alias existing-connections)
+        (message "Connection already exists: %s" alias)
+      (message "Adding new connection")
+      (add-to-list 'existing-connections new-connection)
+      (setq db-connections (json-add-to-object (json-new-object) "connections" existing-connections))
+      (with-temp-file cm/sql-ui-connection-file
+        (insert (json-encode db-connections)))
+      )
+      ))
+
+#+end_src
+
+#+RESULTS:
+: cm/sql-ui-add-connection
+
+#+begin_src emacs-lisp :tangle yes :results raw drawer
+(cm/sql-ui-add-connection 'local_mysql '((driver . "mysql") (host . "127.0.0.1") (username . "chahak") (password . "CPM") (database . "mysql")))
+#+end_src
+
+#+RESULTS:
+:results:
+Connection already exists: local_mysql
+:end:
+* Running queries
+This is backed by the =sql-lsp= language server.
